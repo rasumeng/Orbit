@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Orbit midpoint serverless API - demonstration data only
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+Resources:
+  OrbitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+  OrbitApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowOrigins: ['http://localhost:5173']
+        AllowHeaders: ['content-type']
+        AllowMethods: ['GET', 'POST', 'PATCH', 'OPTIONS']
+  OrbitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrbitTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrbitTable
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref OrbitApi, Path: /health, Method: GET }
+        ListItems:
+          Type: HttpApi
+          Properties: { ApiId: !Ref OrbitApi, Path: /items, Method: GET }
+        CreateItem:
+          Type: HttpApi
+          Properties: { ApiId: !Ref OrbitApi, Path: /items, Method: POST }
+        UpdateItem:
+          Type: HttpApi
+          Properties: { ApiId: !Ref OrbitApi, Path: '/items/{id}', Method: PATCH }
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${OrbitApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  TableName:
+    Value: !Ref OrbitTable
