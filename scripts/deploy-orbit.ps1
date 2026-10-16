@@ -62,4 +62,4 @@ $functionUrl = aws cloudformation describe-stacks --stack-name orbit-midpoint --
 $tableName = aws cloudformation describe-stacks --stack-name orbit-midpoint --region $Region --profile $Profile --query "Stacks[0].Outputs[?OutputKey=='TableName'].OutputValue" --output text
 Write-Host "Function URL: $functionUrl"
 Write-Host "Table name:   $tableName"
-Write-Host 'Set ORBIT_LAMBDA_URL to the Function URL before starting backend.proxy.'
+Write-Host 'Set AWS_PROFILE and AWS_REGION before starting backend.proxy; the local proxy invokes the function by name.'

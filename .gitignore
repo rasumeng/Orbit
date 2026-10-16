@@ -14,3 +14,4 @@ frontend/.env
 *.key
 .aws/
 *.tfstate
+.orbit-proxy*.log

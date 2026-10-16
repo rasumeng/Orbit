@@ -1,64 +1,63 @@
-"""Local-only proxy for Orbit's IAM-protected Lambda Function URL."""
+"""Local-only proxy for Orbit's Lambda API, invoked with local AWS credentials."""
 
 import json
 import os
-from typing import Any
-
+import asyncio
 import boto3
-import httpx
-from botocore.awsrequest import AWSRequest
-from botocore.auth import SigV4Auth
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, ProfileNotFound
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-LAMBDA_URL = os.getenv("ORBIT_LAMBDA_URL", "").rstrip("/")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-AWS_SERVICE = "lambda"
-ALLOWED_PATHS = {"/health", "/items"}
+FUNCTION_NAME = os.getenv("ORBIT_FUNCTION_NAME", "OrbitBackend")
+ALLOWED_PATHS = {"/health", "/spaces", "/spaces/open", "/spaces/me", "/items", "/items/import", "/projects", "/projects/join"}
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 app = FastAPI(title="Orbit local AWS proxy", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["content-type"],
+    allow_headers=["content-type", "x-orbit-access-code"],
 )
 
 
-def signed_request(method: str, url: str, body: bytes, content_type: str | None) -> dict[str, Any]:
-    session = boto3.Session(region_name=AWS_REGION)
-    credentials = session.get_credentials()
-    if credentials is None:
-        raise NoCredentialsError()
-    frozen = credentials.get_frozen_credentials()
-    headers = {"host": url.split("/", 3)[2]}
-    if content_type:
-        headers["content-type"] = content_type
-    aws_request = AWSRequest(method=method, url=url, data=body, headers=headers)
-    SigV4Auth(frozen, AWS_SERVICE, AWS_REGION).add_auth(aws_request)
-    return dict(aws_request.headers.items())
-
-
 async def forward(request: Request, path: str) -> Response:
-    if not LAMBDA_URL:
-        return Response(
-            content=json.dumps({"error": "ORBIT_LAMBDA_URL is not configured for the local proxy"}),
-            status_code=503,
-            media_type="application/json",
-        )
     body = await request.body()
     try:
-        headers = signed_request(request.method, f"{LAMBDA_URL}{path}", body, request.headers.get("content-type"))
-    except NoCredentialsError:
+        credentials = boto3.Session(region_name=AWS_REGION).get_credentials()
+        if credentials is None:
+            raise NoCredentialsError()
+        event = {
+            "requestContext": {"http": {"method": request.method}},
+            "rawPath": path,
+            "headers": {
+                "content-type": request.headers.get("content-type", "application/json"),
+                "x-orbit-access-code": request.headers.get("x-orbit-access-code", ""),
+            },
+            "body": body.decode("utf-8") if body else None,
+        }
+        invocation = await asyncio.to_thread(
+            lambda_client.invoke,
+            FunctionName=FUNCTION_NAME,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(event).encode("utf-8"),
+        )
+        payload = json.loads(invocation["Payload"].read() or b"{}")
+    except (NoCredentialsError, ProfileNotFound):
         return Response(
             content=json.dumps({"error": "AWS credentials are not configured for the local proxy"}),
             status_code=503,
             media_type="application/json",
         )
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        upstream = await client.request(request.method, f"{LAMBDA_URL}{path}", content=body, headers=headers)
-    return Response(content=upstream.content, status_code=upstream.status_code, media_type=upstream.headers.get("content-type", "application/json"))
+    except (BotoCoreError, ClientError, ValueError) as exc:
+        print("Lambda invocation failed:", type(exc).__name__)
+        return Response(content=json.dumps({"error": "Could not reach the Orbit Lambda function"}), status_code=502, media_type="application/json")
+    if invocation.get("FunctionError") or not isinstance(payload, dict):
+        return Response(content=json.dumps({"error": "Orbit Lambda function failed"}), status_code=502, media_type="application/json")
+    response_body = payload.get("body", "{}")
+    response_headers = payload.get("headers") or {}
+    return Response(content=response_body, status_code=payload.get("statusCode", 502), media_type=response_headers.get("content-type", "application/json"))
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PATCH"])
