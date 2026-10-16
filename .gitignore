@@ -6,3 +6,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.pyc
+venv/
+*.tsbuildinfo
+backend/.env
+frontend/.env
+*.pem
+*.key
+.aws/
+*.tfstate

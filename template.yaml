@@ -1,15 +1,31 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Orbit midpoint serverless API - demonstration data only
+Description: Orbit midpoint API - Lambda Function URL and DynamoDB
+
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: ARN of an existing Lambda execution role authorized in this AWS Academy account.
+  TableResourcePolicyEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Attach DynamoDB access as a table resource policy. Set false if PutResourcePolicy is denied.
+
+Conditions:
+  UseTableResourcePolicy: !Equals [!Ref TableResourcePolicyEnabled, 'true']
+
 Globals:
   Function:
     Runtime: python3.12
     Timeout: 10
     MemorySize: 128
+
 Resources:
   OrbitTable:
     Type: AWS::DynamoDB::Table
     Properties:
+      TableName: OrbitItems
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: id
@@ -17,40 +33,55 @@ Resources:
       KeySchema:
         - AttributeName: id
           KeyType: HASH
-  OrbitApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      StageName: '$default'
-      CorsConfiguration:
-        AllowOrigins: ['http://localhost:5173']
-        AllowHeaders: ['content-type']
-        AllowMethods: ['GET', 'POST', 'PATCH', 'OPTIONS']
+      ResourcePolicy: !If
+        - UseTableResourcePolicy
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowOrbitLambdaDataAccess
+                Effect: Allow
+                Principal:
+                  AWS: !Ref ExecutionRoleArn
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/OrbitItems'
+        - !Ref AWS::NoValue
+
   OrbitFunction:
     Type: AWS::Serverless::Function
     Properties:
+      FunctionName: OrbitBackend
       CodeUri: backend/
       Handler: app.handler
+      Role: !Ref ExecutionRoleArn
       Environment:
         Variables:
           TABLE_NAME: !Ref OrbitTable
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref OrbitTable
-      Events:
-        Health:
-          Type: HttpApi
-          Properties: { ApiId: !Ref OrbitApi, Path: /health, Method: GET }
-        ListItems:
-          Type: HttpApi
-          Properties: { ApiId: !Ref OrbitApi, Path: /items, Method: GET }
-        CreateItem:
-          Type: HttpApi
-          Properties: { ApiId: !Ref OrbitApi, Path: /items, Method: POST }
-        UpdateItem:
-          Type: HttpApi
-          Properties: { ApiId: !Ref OrbitApi, Path: '/items/{id}', Method: PATCH }
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
+        Cors:
+          AllowOrigins:
+            - http://localhost:5173
+            - http://127.0.0.1:5173
+          AllowHeaders:
+            - content-type
+          AllowMethods:
+            - GET
+            - POST
+            - PATCH
+
 Outputs:
-  ApiUrl:
-    Value: !Sub 'https://${OrbitApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  FunctionUrl:
+    Description: IAM-protected Lambda Function URL for the local FastAPI proxy.
+    Value: !GetAtt OrbitFunctionUrl.FunctionUrl
   TableName:
+    Description: DynamoDB table used by Orbit.
     Value: !Ref OrbitTable
+  FunctionName:
+    Description: Orbit Lambda function name.
+    Value: !Ref OrbitFunction

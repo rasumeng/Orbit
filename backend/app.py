@@ -34,6 +34,8 @@ def validate_create(obj):
     if obj.get('priority', 'medium') not in PRIORITIES:
         return 'Invalid priority'
     due = obj.get('dueAt')
+    if due is None:
+        return None
     if not isinstance(due, str):
         return 'dueAt must be ISO 8601 with timezone'
     try:
@@ -66,9 +68,11 @@ def handler(event, context):
             item = {
                 'id': str(uuid4()), 'title': obj['title'].strip(),
                 'category': obj['category'], 'priority': obj.get('priority', 'medium'),
-                'dueAt': obj['dueAt'], 'status': 'pending', 'source': 'manual',
+                'status': 'pending', 'source': 'manual',
                 'createdAt': datetime.now(timezone.utc).isoformat()
             }
+            if obj.get('dueAt') is not None:
+                item['dueAt'] = obj['dueAt']
             table.put_item(Item=item)
             return response(201, {'item': item})
         if method == 'PATCH' and path.startswith('/items/'):

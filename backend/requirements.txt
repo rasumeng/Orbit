@@ -1,0 +1,3 @@
+# boto3 is provided by the AWS Lambda Python 3.12 runtime.
+# Local proxy dependencies are listed in proxy-requirements.txt.
+
