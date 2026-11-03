@@ -125,3 +125,15 @@ Resources:
       Principal: cloudfront.amazonaws.com
       SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
       InvokedViaFunctionUrl: true
+Outputs:
+  BucketName:
+    Description: S3 bucket for the Orbit React frontend
+    Value: !Ref FrontendBucket
+
+  DistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref FrontendDistribution
+
+  WebsiteURL:
+    Description: HTTPS URL of the deployed Orbit application
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
