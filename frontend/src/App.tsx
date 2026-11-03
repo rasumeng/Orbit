@@ -28,11 +28,29 @@ type Project = { id: string; name: string; inviteCode: string; members: string[]
 const API = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
 const categories: Category[] = ['school', 'work', 'leadership', 'projects', 'personal']
 
+async function apiFetch(url: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers)
+
+  if (typeof init?.body === 'string') {
+    const bytes = new TextEncoder().encode(init.body)
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+
+    const hash = Array.from(
+      new Uint8Array(digest),
+      byte => byte.toString(16).padStart(2, '0')
+    ).join('')
+
+    headers.set('x-amz-content-sha256', hash)
+  }
+
+  return fetch(url, { ...init, headers })
+}
+
 async function authorizedFetch(url: string, init?: RequestInit) {
   const headers = new Headers(init?.headers)
   const accessCode = window.localStorage.getItem('orbit.accessCode')
   if (accessCode) headers.set('x-orbit-access-code', accessCode)
-  const response = await fetch(url, { ...init, headers })
+  const response = await apiFetch(url, { ...init, headers })
   if (response.status === 401) window.dispatchEvent(new Event('orbit-session-expired'))
   return response
 }
@@ -166,7 +184,7 @@ export default function App() {
     setGateBusy(true)
     setGateError('')
     try {
-      const r = await fetch(`${API}/spaces`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: spaceName.trim() }) })
+      const r = await apiFetch(`${API}/spaces`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: spaceName.trim() }) })
       const data = await r.json()
       if (!r.ok) throw Error(data.error || `API returned ${r.status}`)
       window.localStorage.setItem('orbit.accessCode', data.accessCode)
@@ -184,7 +202,7 @@ export default function App() {
     setGateError('')
     const code = gateCode.replace(/\s+/g, '').toUpperCase()
     try {
-      const r = await fetch(`${API}/spaces/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: code }) })
+      const r = await apiFetch(`${API}/spaces/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ accessCode: code }) })
       const data = await r.json()
       if (!r.ok) throw Error(data.error || `API returned ${r.status}`)
       window.localStorage.setItem('orbit.accessCode', code)

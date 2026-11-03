@@ -83,6 +83,12 @@ def workspace_id_from_code(code):
 def handler(event, context):
     method = (event.get('requestContext', {}).get('http', {}).get('method') or event.get('httpMethod'))
     path = event.get('rawPath') or event.get('path') or ''
+
+    if path == '/api':
+        path= '/'
+    elif path.startswith('/api/'):
+        path = path[4:]
+
     if method == 'GET' and path == '/health':
         return response(200, {'status': 'ok', 'service': 'orbit'})
     table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
