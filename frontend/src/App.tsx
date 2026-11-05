@@ -55,6 +55,24 @@ async function authorizedFetch(url: string, init?: RequestInit) {
   return response
 }
 
+async function fetchAllItems() {
+  const items: Item[] = []
+  let cursor: string | undefined
+  const seenCursors = new Set<string>()
+  do {
+    const url = `${API}/items${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`
+    const response = await authorizedFetch(url)
+    if (!response.ok) throw Error(`API returned ${response.status}`)
+    const data: { items?: Item[]; nextCursor?: string | null } = await response.json()
+    if (!Array.isArray(data.items)) throw Error('The API returned an incomplete task response.')
+    items.push(...data.items)
+    cursor = data.nextCursor ?? undefined
+    if (cursor && seenCursors.has(cursor)) throw Error('The API repeated a pagination cursor; task loading stopped to avoid incomplete data.')
+    if (cursor) seenCursors.add(cursor)
+  } while (cursor)
+  return items
+}
+
 function formatDueDate(value: string) {
   return new Date(value).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
@@ -234,10 +252,8 @@ export default function App() {
     if (!accessCode) return
     try {
       setError('')
-      const r = await authorizedFetch(`${API}/items`)
-      if (!r.ok) throw Error(`API returned ${r.status}`)
-      const data = await r.json()
-      setItems(data.items ?? [])
+      const allItems = await fetchAllItems()
+      setItems(allItems)
     } catch (e) { setError(String(e)) }
   }
 
@@ -269,10 +285,10 @@ export default function App() {
     if (workspaceTab !== 'projects' || !API || !accessCode) return
     const refreshSharedSpace = async () => {
       try {
-        const [itemsResponse, projectsResponse] = await Promise.all([authorizedFetch(`${API}/items`), authorizedFetch(`${API}/projects`)])
-        if (!itemsResponse.ok || !projectsResponse.ok) return
-        const [itemsData, projectsData] = await Promise.all([itemsResponse.json(), projectsResponse.json()])
-        setItems(itemsData.items ?? [])
+        const [allItems, projectsResponse] = await Promise.all([fetchAllItems(), authorizedFetch(`${API}/projects`)])
+        if (!projectsResponse.ok) return
+        const projectsData = await projectsResponse.json()
+        setItems(allItems)
         setProjects(projectsData.projects ?? [])
       } catch {
         // Keep the current view available when a background refresh briefly fails.
