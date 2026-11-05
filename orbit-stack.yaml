@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Orbit full-stack serverless deployment (packaged Lambda and React artifacts)
+
+Parameters:
+  ExecutionRoleArn:
+    Type: String
+    Description: Existing Lambda execution role ARN with DynamoDB, logs and artifact S3 read access
+  ArtifactBucket:
+    Type: String
+    Description: Pre-existing S3 bucket containing packaged Orbit release artifacts
+  BackendZipKey:
+    Type: String
+    Description: S3 key of Lambda ZIP containing app.py at ZIP root
+  FrontendZipKey:
+    Type: String
+    Description: S3 key of built React ZIP containing index.html at ZIP root
+  ArtifactVersion:
+    Type: String
+    Description: Unique release identifier; change it when artifact contents change
+  TableResourcePolicyEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set false where DynamoDB resource policies are unavailable (role then requires identity permissions)
+
+Conditions:
+  UseTableResourcePolicy: !Equals [!Ref TableResourcePolicyEnabled, 'true']
+
+Resources:
+  OrbitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-OrbitItems'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ResourcePolicy: !If
+        - UseTableResourcePolicy
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowOrbitLambdaDataAccess
+                Effect: Allow
+                Principal:
+                  AWS: !Ref ExecutionRoleArn
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-OrbitItems'
+        - !Ref AWS::NoValue
+
+  OrbitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !Ref ExecutionRoleArn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref BackendZipKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrbitTable
+      Description: !Sub 'Orbit API, release ${ArtifactVersion}'
+
+  OrbitFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt OrbitFunction.Arn
+      AuthType: AWS_IAM
+      InvokeMode: BUFFERED
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3-oac'
+        Description: Private Orbit frontend S3 origin
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ApiOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-lambda-oac'
+        Description: IAM-signed Orbit Lambda Function URL origin
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} Orbit frontend and API'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: OrbitFrontendS3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: OrbitBackendLambda
+            DomainName: !Select [2, !Split ['/', !GetAtt OrbitFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !Ref ApiOriginAccessControl
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: OrbitFrontendS3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: OrbitBackendLambda
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+          - Sid: AllowArtifactDeployerList
+            Effect: Allow
+            Principal:
+              AWS: !Ref ExecutionRoleArn
+            Action: s3:ListBucket
+            Resource: !GetAtt FrontendBucket.Arn
+          - Sid: AllowArtifactDeployerWrite
+            Effect: Allow
+            Principal:
+              AWS: !Ref ExecutionRoleArn
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  AllowCloudFrontInvokeFunctionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref OrbitFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+      FunctionUrlAuthType: AWS_IAM
+
+  AllowCloudFrontInvokeFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OrbitFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+      InvokedViaFunctionUrl: true
+
+  FrontendDeployer:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref ExecutionRoleArn
+      Timeout: 300
+      MemorySize: 256
+      Description: Copy the release's built React ZIP into the Orbit frontend bucket
+      Code:
+        ZipFile: |
+          import io
+          import zipfile
+          import boto3
+          import cfnresponse
+          import mimetypes
+          import os
+
+          s3 = boto3.client('s3')
+
+          def clear_bucket(bucket):
+              pager = s3.get_paginator('list_objects_v2')
+              for page in pager.paginate(Bucket=bucket):
+                  keys = [{'Key': obj['Key']} for obj in page.get('Contents', [])]
+                  for i in range(0, len(keys), 1000):
+                      s3.delete_objects(Bucket=bucket, Delete={'Objects': keys[i:i+1000]})
+
+          def handler(event, context):
+              p = event['ResourceProperties']
+              destination = p['DestinationBucket']
+              physical_id = 'orbit-frontend-content-' + destination
+              try:
+                  if event['RequestType'] == 'Delete':
+                      clear_bucket(destination)
+                  else:
+                      source_bucket = p['ArtifactBucket']
+                      source_key = p['FrontendZipKey']
+                      archive = s3.get_object(Bucket=source_bucket, Key=source_key)['Body'].read()
+                      with zipfile.ZipFile(io.BytesIO(archive)) as z:
+                          names = [n for n in z.namelist() if not n.endswith('/')]
+                          if 'index.html' not in names:
+                              raise ValueError('React ZIP must contain index.html at ZIP root')
+                          if any(n.startswith('/') or '..' in n.split('/') or '\\' in n for n in names):
+                              raise ValueError('Unsafe ZIP entry path')
+                          # This bucket belongs to this stack and hosts only generated assets.
+                          clear_bucket(destination)
+                          for name in names:
+                              mime, _ = mimetypes.guess_type(name)
+                              s3.put_object(
+                                  Bucket=destination,
+                                  Key=name,
+                                  Body=z.read(name),
+                                  ContentType=mime or 'application/octet-stream',
+                                  CacheControl='no-cache' if name == 'index.html' else 'public, max-age=3600'
+                              )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as e:
+                  print('Frontend deployment failed:', repr(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, physical_id)
+
+  FrontendContent:
+    Type: Custom::OrbitFrontendContent
+    DependsOn:
+      - FrontendBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt FrontendDeployer.Arn
+      DestinationBucket: !Ref FrontendBucket
+      ArtifactBucket: !Ref ArtifactBucket
+      FrontendZipKey: !Ref FrontendZipKey
+      ArtifactVersion: !Ref ArtifactVersion
+
+Outputs:
+  WebsiteURL:
+    Description: CloudFront HTTPS URL (allow CloudFront time to propagate)
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  DistributionId:
+    Value: !Ref FrontendDistribution
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FunctionName:
+    Value: !Ref OrbitFunction
+  FunctionUrl:
+    Value: !GetAtt OrbitFunctionUrl.FunctionUrl
+  TableName:
+    Value: !Ref OrbitTable
