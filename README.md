@@ -10,9 +10,7 @@ Beyond its application features, Orbit demonstrates the design, deployment, inte
 
 The application is deployed entirely on AWS using a serverless architecture. Users access Orbit through Amazon CloudFront, while AWS Lambda handles backend operations and Amazon DynamoDB provides persistent storage.
 
-**Live Application:** [https://d10op2gg45n9aa.cloudfront.net](https://d10op2gg45n9aa.cloudfront.net)
-
-*Note: The application URL is associated with an specific instance of AWS Academy sandbox deployment and may change if the infrastructure is recreated.*
+The current website URL is available from the unified CloudFormation stack's `WebsiteURL` output. The URL changes when the stack is recreated.
 
 ## Features
 
@@ -125,12 +123,14 @@ Orbit/
 │   ├── package-lock.json
 │   └── .env.production
 ├── scripts/
-│   ├── deploy-orbit.ps1
-│   ├── deploy-frontend.ps1
+│   ├── package-release.ps1
+│   ├── package_release.py
+│   ├── publish-release.ps1
 │   └── teardown-orbit.ps1
 ├── docs/
 │   └── MIDPOINT_EVALUATION.md
 ├── template.yaml
+├── orbit-stack.yaml
 ├── orbit-frontend-template.yaml
 └── README.md
 ```
@@ -139,187 +139,113 @@ Orbit/
 
 | File                           | Purpose                                                                                    |
 | ------------------------------ | ------------------------------------------------------------------------------------------ |
-| `template.yaml`                | Defines the Lambda backend, DynamoDB table, and Function URL.                              |
-| `orbit-frontend-template.yaml` | Defines S3 hosting, CloudFront, Origin Access Controls, and Lambda invocation permissions. |
-| `scripts/deploy-orbit.ps1`     | Validates, builds, and deploys the backend infrastructure.                                 |
-| `scripts/deploy-frontend.ps1`  | Builds React, uploads assets to S3, and invalidates CloudFront.                            |
-| `scripts/teardown-orbit.ps1`   | Provides an opt-in deletion workflow for the backend CloudFormation stack.                 |
+| `orbit-stack.yaml`             | Unified CloudFormation template for Lambda, DynamoDB, private S3, CloudFront, and API access. |
+| `template.yaml`                | Legacy SAM backend template; retained for reference, not used by the unified release workflow. |
+| `orbit-frontend-template.yaml` | Legacy split frontend template; retained for reference, not used by the unified release workflow. |
+| `scripts/package-release.ps1`  | Builds and validates immutable versioned release artifacts locally. |
+| `scripts/publish-release.ps1`  | Publishes artifacts under a unique S3 release prefix using AWS CLI credentials. |
+| `scripts/teardown-orbit.ps1`   | Legacy SAM-stack teardown helper; it does not delete the unified stack.                      |
 | `frontend/.env.production`     | Configures the production frontend to use `/api` through CloudFront.                       |
 
 ## AWS Deployment
 
-Orbit can be deployed to an AWS Academy Learner Lab environment using a unified AWS CloudFormation template.
-
-The deployment provisions the frontend, backend, database, and networking infrastructure as a single CloudFormation stack. Once the application artifacts are prepared in Amazon S3, deployment can be completed through the AWS Management Console without configuring a local AWS CLI profile.
+Orbit uses `orbit-stack.yaml` as its unified CloudFormation template. Release artifacts are built locally, published to a private S3 artifact bucket under an immutable versioned prefix, and deployed through the AWS Management Console. Deployment does not require GitHub Actions, CodePipeline, CloudFormation Git sync, or a local CloudFormation deployment command.
 
 ### Prerequisites
 
-- Access to an AWS Academy Learner Lab
-- An existing `lambda-run-role` with the necessary S3, DynamoDB, and CloudWatch permissions
-- A private S3 bucket containing the application deployment artifacts
-- The unified infrastructure template (`orbit-stack.yaml`)
+- AWS Academy Learner Lab access and a current session.
+- AWS Management Console access to CloudFormation, Lambda, S3, CloudFront, DynamoDB, and the existing Lambda execution role.
+- An S3 artifact bucket in the deployment account/region. Keep Block Public Access enabled. The publishing identity needs `s3:ListBucket` and `s3:PutObject`; the Lambda execution role needs `s3:GetObject` for release artifacts.
+- A Lambda execution role ARN in the deployment account, with CloudWatch Logs and DynamoDB data access. The stack grants that role access to its frontend bucket through a bucket policy. If the account denies DynamoDB table resource policies, set `TableResourcePolicyEnabled` to `false` and ensure the role has table access.
+- Python 3.10 or newer, Node.js/npm, and AWS CLI v2 on the packaging/publishing computer.
 
-For preparing new application releases, Node.js, Python, and Git are also required.
+AWS Academy credentials are temporary. For S3 publication, use the credentials exported by the Learner Lab or configure a short-lived AWS CLI profile. The publishing script uses the standard AWS CLI credential chain and never prints or stores credential values. The CloudFormation create/update itself can be performed in the console.
 
-### 1. Start the AWS Academy Environment
+### Package a release
 
-1. Sign in to AWS Academy.
-2. Start the Learner Lab.
-3. Open the AWS Management Console.
-4. Select **US East (N. Virginia) — `us-east-1`**.
-5. Confirm that the existing `lambda-run-role` is available through IAM.
-
-AWS Academy accounts use temporary credentials and may have restricted IAM permissions.
-
-### 2. Prepare the Application Artifacts
-
-Orbit requires three deployment files:
-
-| File | Purpose |
-|---|---|
-| `orbit-stack.yaml` | Unified CloudFormation infrastructure template |
-| `orbit-backend.zip` | Python Lambda backend package |
-| `orbit-frontend.zip` | Compiled React frontend package |
-
-The backend ZIP must contain `app.py` at its root.
-
-The frontend must first be compiled using:
+Choose a new release ID for every content change, such as a date plus short Git revision. Do not reuse a release ID.
 
 ```powershell
-cd frontend
-npm ci
-npm run build
-cd ..
+.\scripts\package-release.ps1 -ReleaseId 2026-11-04-a1b2c3d
 ```
 
-Create the frontend ZIP using Python to preserve forward-slash paths:
+The script runs `npm ci` and `npm run build` with a release-specific Vite asset base. It creates deterministic ZIPs and validates their contents before publication:
+
+- `artifacts/releases/<release-id>/orbit-backend.zip` contains only `app.py` at the ZIP root. Boto3 is supplied by the Python 3.12 Lambda runtime.
+- `artifacts/releases/<release-id>/orbit-frontend.zip` contains the built site with `index.html` at its root and forward-slash ZIP entry paths. Asset URLs point to `/releases/<release-id>/`.
+- `artifacts/releases/<release-id>/orbit-stack.yaml` is the exact unified template for this release.
+- `artifacts/releases/<release-id>/release.json` records artifact keys and SHA-256 digests.
+
+The package command refuses to overwrite an existing local release directory. Generated release artifacts are ignored by Git and should not be committed.
+
+### Publish artifacts to S3
+
+Use AWS Academy's current temporary credentials (or pass a configured profile):
 
 ```powershell
-@'
-from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
-
-root = Path("frontend/dist")
-output = Path("artifacts/orbit-frontend.zip")
-output.parent.mkdir(exist_ok=True)
-
-with ZipFile(output, "w", ZIP_DEFLATED) as archive:
-    for file in root.rglob("*"):
-        if file.is_file():
-            archive.write(file, file.relative_to(root).as_posix())
-'@ | python -
+.\scripts\publish-release.ps1 `
+  -ReleaseId 2026-11-04-a1b2c3d `
+  -ArtifactBucket YOUR_PRIVATE_ARTIFACT_BUCKET `
+  -Region us-east-1
 ```
 
-For a backend containing only the current Lambda handler, package `backend/app.py` at the ZIP root. Additional dependencies must be included if introduced later.
+Optionally add `-Profile your-temporary-profile`. The script revalidates the release, checks that the S3 release prefix is unused, then uploads the template, both ZIPs, and manifest under `releases/<release-id>/`. A failed or partial upload leaves that prefix reserved; package and publish a new release ID for a clean retry. The script prints the CloudFormation template URL and the exact parameter values to use. It does not create or update a stack.
 
-### 3. Upload Artifacts to S3
+### Create the initial stack
 
-In the AWS Console:
+1. In the AWS Console, open **CloudFormation → Create stack → With new resources (standard)**.
+2. Choose the template URL printed by `publish-release.ps1`. The console identity must be able to read that object.
+3. Enter a stack name, for example `orbit`.
+4. Set parameters from the publishing output:
+   - `ArtifactBucket`: the private artifact bucket name.
+   - `BackendZipKey`: the printed `BackendZipKey`.
+   - `FrontendZipKey`: the printed `FrontendZipKey`.
+   - `ArtifactVersion`: the release ID.
+   - `ExecutionRoleArn`: the existing Lambda execution role ARN in this account.
+   - `TableResourcePolicyEnabled`: `true` if the account permits the table resource policy; otherwise `false` with equivalent identity permissions on the role.
+5. Review the CloudFormation change set and submit. Wait for `CREATE_COMPLETE`; CloudFront distribution deployment can take additional time.
+6. Open the stack's **Outputs** tab and use `WebsiteURL`.
 
-1. Navigate to **Amazon S3**.
-2. Create or open a private artifact bucket.
-3. Keep Block Public Access enabled.
-4. Enable bucket versioning.
-5. Upload the three deployment files.
+The stack creates the private frontend bucket, CloudFront distribution and OACs, Lambda Function URL and API, DynamoDB table, and the custom resource that publishes the frontend. The DynamoDB table has `DeletionPolicy: Retain` and `UpdateReplacePolicy: Retain` to protect user data.
 
-Our tested deployment uses:
+Ordinary Lambda and frontend releases do not replace the table. Its name is fixed from the stack name; a future key-schema or table-name change that requires replacement needs a planned migration to a distinct table name because retention intentionally preserves the current table. After deleting a stack, recreating it with the same name also requires importing/adopting the retained table or using a distinct table name and planning the data migration.
 
-`orbit-deployment-artifacts-1002095331`
+### Update an existing stack
 
-The artifact bucket must be accessible in the AWS account used for deployment. A separate AWS Academy account may require its own artifact bucket and uploads.
+1. Package and publish a new release with a new release ID.
+2. Open the existing stack and choose **Update stack**.
+3. Replace the template with the new release's printed template URL (the infrastructure changes are versioned with the release).
+4. Keep the stack name and `ExecutionRoleArn` unchanged. Update `ArtifactBucket`, `BackendZipKey`, `FrontendZipKey`, and `ArtifactVersion` to the new release values.
+5. Review the change set. Confirm that `OrbitFunction` is updated in place and that the frontend distribution and S3 bucket are not replaced. Submit and wait for `UPDATE_COMPLETE`.
+6. Verify the new release using the same checks below.
 
-### 4. Deploy with CloudFormation
+The Lambda `Code.S3Key` parameter change triggers a code update while retaining the same Lambda logical resource and function name. A change to the custom resource's frontend key/version triggers content publication without changing the CloudFront distribution. Do not update a release in place or reuse its release ID.
 
-1. Navigate to **AWS CloudFormation → Create stack**.
-2. Select **With new resources (standard)**.
-3. Provide the S3 URL of `orbit-stack.yaml`, or upload the template file directly.
-4. Choose a stack name, such as `orbit-unified`.
-5. Configure the deployment parameters.
+### Verification
 
-| Parameter | Example value |
-|---|---|
-| `ArtifactBucket` | `orbit-deployment-artifacts-1002095331` |
-| `ArtifactVersion` | `v1` |
-| `BackendZipKey` | `orbit-backend.zip` |
-| `FrontendZipKey` | `orbit-frontend.zip` |
-| `ExecutionRoleArn` | ARN of the existing `lambda-run-role` |
-| `TableResourcePolicyEnabled` | `true` |
+- Confirm CloudFormation reaches `CREATE_COMPLETE` or `UPDATE_COMPLETE`; inspect **Events** for failed resources.
+- Open `WebsiteURL` from stack Outputs and check that the frontend loads.
+- Request `<WebsiteURL>/api/health`; expect `{"status":"ok","service":"orbit"}`.
+- Create/open a workspace, add a task, refresh, and verify it persists. Confirm project and calendar-import paths if those features are part of the release.
+- Check CloudWatch logs for `OrbitFunction` and `FrontendDeployer` if requests or deployment resources fail.
+- These checks are the operator's live AWS verification. Local packaging, tests, and CloudFormation validation do not prove AWS Academy permissions or live distribution behavior.
 
-The execution role ARN must belong to the current AWS account.
+### Troubleshooting
 
-6. Review the stack options and deployment parameters.
-7. Submit the CloudFormation stack.
-8. Monitor the **Events** tab until the stack reaches `CREATE_COMPLETE`.
+- **S3 publication fails:** restart the Learner Lab and refresh temporary credentials. Confirm the CLI identity can list the artifact bucket and put objects. Do not pass long-term keys on the command line.
+- **Release prefix already exists:** use a new release ID. Published prefixes are immutable; partial uploads are not overwritten.
+- **Template cannot be loaded:** confirm the console identity can read the versioned template object and the URL is in the deployment region.
+- **CloudFormation rejects the table policy:** set `TableResourcePolicyEnabled` to `false` and verify the Lambda role has DynamoDB permissions.
+- **Frontend custom resource fails:** inspect its CloudWatch log stream and CloudFormation event reason. It validates the full ZIP before upload, writes versioned assets first, and changes root `index.html` last. Older release assets remain to support cached pages and stack rollback.
+- **Frontend is stale:** confirm `ArtifactVersion` changed and `FrontendZipKey` points to the new release. Wait for CloudFront propagation; root HTML is published with no-cache headers and assets use immutable release paths.
+- **Lambda code did not update:** ensure `BackendZipKey` changed to the new release path and inspect the change set before submission.
+- **Custom resource cannot read/write objects:** grant the execution role read access to the artifact prefix and ensure the stack's frontend bucket policy was created. Its role also needs CloudWatch Logs permissions.
 
-CloudFormation automatically creates the DynamoDB table, Lambda functions, IAM-protected Function URL, private S3 frontend bucket, CloudFront distribution, and origin-access permissions. A Lambda-backed custom resource uploads the frontend assets to the hosting bucket.
+### Resource cleanup
 
-### 5. Access Orbit
+Deleting the CloudFormation stack removes its generated frontend bucket contents, CloudFront distribution, Lambda functions, URL configuration, and related resources. The DynamoDB table is retained deliberately to protect user data. Because its name is derived from the stack name, a same-name stack recreation must import/adopt the retained table or use a distinct table name and plan a data migration. Export or back up anything needed before separately deleting that retained table through an explicit, reviewed data-retention process. Artifact bucket objects are not deleted by the stack; remove old release prefixes manually only after they are no longer needed for rollback or audit.
 
-After the deployment completes:
-
-1. Open **CloudFormation → Stacks → orbit-unified**.
-2. Select the **Outputs** tab.
-3. Locate `WebsiteURL`.
-4. Open the generated HTTPS URL.
-
-For the successfully tested unified deployment, the URL is:
-
-https://d2dov77uex6fah.cloudfront.net
-
-This URL belongs to the current sandbox deployment and may change when the infrastructure is recreated.
-
-### 6. Verify the Deployment
-
-Test the backend by navigating to:
-
-`https://YOUR_CLOUDFRONT_DOMAIN/api/health`
-
-Expected response:
-
-```json
-{
-  "status": "ok",
-  "service": "orbit"
-}
-```
-
-Then test application persistence:
-
-1. Create a workspace.
-2. Create a responsibility.
-3. Refresh the application.
-4. Confirm the responsibility remains available.
-5. Mark it completed and refresh again.
-6. Confirm that the completed status persists.
-
-These tests verify communication among CloudFront, Lambda, and DynamoDB.
-
-### 7. Updating an Existing Deployment
-
-To deploy updated application code:
-
-1. Rebuild the changed application packages.
-2. Upload the new ZIP files to S3.
-3. Open the existing CloudFormation stack.
-4. Select **Update stack**.
-5. Use the existing infrastructure template, or upload a revised template if infrastructure has changed.
-6. Change `ArtifactVersion` to a new value, such as `v2`.
-7. Review and submit the update.
-
-For reproducible releases, store artifacts under version-specific S3 keys rather than overwriting previously published packages.
-
-The `ArtifactVersion` parameter triggers a redeployment of the frontend custom resource. Backend code changes should also use a new S3 object key or object version so CloudFormation recognizes the update.
-
-### AWS Academy Considerations
-
-The deployment was tested successfully in AWS Academy using CloudFormation, Lambda, S3, DynamoDB, CloudFront, and IAM.
-
-CloudFormation Git sync and GitHub-based CodePipeline integration were unavailable because of AWS Organizations service control policy restrictions.
-
-As a result, Orbit uses **CloudFormation-based deployment with S3-hosted application artifacts**, avoiding those restricted integrations.
-
-The current workflow automates infrastructure provisioning and application deployment after the artifacts have been prepared. Artifact packaging and publication remain separate steps.
-
+The older `template.yaml`, `orbit-frontend-template.yaml`, `deploy-orbit.ps1`, and `deploy-frontend.ps1` are retained for reference. Use only the unified `orbit-stack.yaml` release workflow above for new deployments and application updates.
 ## API Endpoints
 
 The deployed API is accessed through the CloudFront `/api` prefix.
@@ -387,7 +313,7 @@ Potential improvements include:
 - Additional CloudWatch monitoring and operational metrics
 - Automated deployment pipelines
 
-The current DynamoDB listing implementation uses scans with fixed limits and does not provide full pagination.
+The current DynamoDB listing implementation paginates scans. A purpose-built indexed access pattern may be more efficient for substantially larger datasets.
 
 Calendar imports are performed using downloaded `.ics` files. Automatic calendar account synchronization is not implemented.
 

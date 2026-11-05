@@ -27,10 +27,6 @@ Write-Host "AWS ARN:     $($identity.Arn)"
 Write-Host "AWS region:  $Region (profile default: $configuredRegion)"
 Write-Host "Role ARN:    $ExecutionRoleArn"
 
-if ($identity.Account -eq '571487732810') {
-  Write-Warning 'This is the previous Orbit sandbox account, not the current account supplied for this session.'
-}
-
 sam validate --lint --region $Region
 if ($LASTEXITCODE -ne 0) {
   throw 'SAM validation failed. Build/deployment was not started.'

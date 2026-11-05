@@ -16,7 +16,9 @@ Parameters:
     Description: S3 key of built React ZIP containing index.html at ZIP root
   ArtifactVersion:
     Type: String
-    Description: Unique release identifier; change it when artifact contents change
+    Description: Unique release identifier used for immutable frontend asset paths
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+    ConstraintDescription: Use 1–64 letters, numbers, dots, underscores, or hyphens; start with a letter or number.
   TableResourcePolicyEnabled:
     Type: String
     Default: 'true'
@@ -29,6 +31,8 @@ Conditions:
 Resources:
   OrbitTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${AWS::StackName}-OrbitItems'
       BillingMode: PAY_PER_REQUEST
@@ -213,7 +217,7 @@ Resources:
       Role: !Ref ExecutionRoleArn
       Timeout: 300
       MemorySize: 256
-      Description: Copy the release's built React ZIP into the Orbit frontend bucket
+      Description: Publish validated versioned React assets and switch the root index last
       Code:
         ZipFile: |
           import io
@@ -221,7 +225,7 @@ Resources:
           import boto3
           import cfnresponse
           import mimetypes
-          import os
+          import re
 
           s3 = boto3.client('s3')
 
@@ -230,39 +234,97 @@ Resources:
               for page in pager.paginate(Bucket=bucket):
                   keys = [{'Key': obj['Key']} for obj in page.get('Contents', [])]
                   for i in range(0, len(keys), 1000):
-                      s3.delete_objects(Bucket=bucket, Delete={'Objects': keys[i:i+1000]})
+                      result = s3.delete_objects(Bucket=bucket, Delete={'Objects': keys[i:i+1000]})
+                      if result.get('Errors'):
+                          raise RuntimeError('Could not remove every frontend object: ' + repr(result['Errors']))
+
+          def clear_prefix(bucket, prefix):
+              pager = s3.get_paginator('list_objects_v2')
+              for page in pager.paginate(Bucket=bucket, Prefix=prefix):
+                  keys = [{'Key': obj['Key']} for obj in page.get('Contents', [])]
+                  for i in range(0, len(keys), 1000):
+                      result = s3.delete_objects(Bucket=bucket, Delete={'Objects': keys[i:i+1000]})
+                      if result.get('Errors'):
+                          raise RuntimeError('Could not remove incomplete frontend objects: ' + repr(result['Errors']))
+
+          def validate_name(name):
+              if (not name or name.startswith('/') or '\\' in name or
+                      any(part in ('', '.', '..') for part in name.split('/'))):
+                  raise ValueError('Unsafe ZIP entry path: ' + repr(name))
+              if re.match(r'^[A-Za-z]:', name):
+                  raise ValueError('Drive-qualified ZIP entry path')
+
+          def read_release(archive):
+              with zipfile.ZipFile(io.BytesIO(archive)) as z:
+                  entries = [info for info in z.infolist() if not info.is_dir()]
+                  names = [entry.filename for entry in entries]
+                  if len(names) != len(set(names)):
+                      raise ValueError('Frontend ZIP contains duplicate paths')
+                  for name in names:
+                      validate_name(name)
+                  if 'index.html' not in names:
+                      raise ValueError('React ZIP must contain index.html at ZIP root')
+                  if sum(entry.file_size for entry in entries) > 50 * 1024 * 1024:
+                      raise ValueError('Frontend ZIP expands beyond the 50 MiB deployment limit')
+                  if z.testzip():
+                      raise ValueError('Frontend ZIP failed its CRC check')
+                  return {name: z.read(name) for name in names}
 
           def handler(event, context):
               p = event['ResourceProperties']
               destination = p['DestinationBucket']
               physical_id = 'orbit-frontend-content-' + destination
+              prefix = None
+              index_published = False
               try:
                   if event['RequestType'] == 'Delete':
+                      # This bucket is stack-owned generated frontend content. Empty it
+                      # so CloudFormation can delete it; the DynamoDB table is retained.
                       clear_bucket(destination)
                   else:
+                      version = p['ArtifactVersion']
+                      if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
+                          raise ValueError('Invalid ArtifactVersion')
                       source_bucket = p['ArtifactBucket']
                       source_key = p['FrontendZipKey']
-                      archive = s3.get_object(Bucket=source_bucket, Key=source_key)['Body'].read()
-                      with zipfile.ZipFile(io.BytesIO(archive)) as z:
-                          names = [n for n in z.namelist() if not n.endswith('/')]
-                          if 'index.html' not in names:
-                              raise ValueError('React ZIP must contain index.html at ZIP root')
-                          if any(n.startswith('/') or '..' in n.split('/') or '\\' in n for n in names):
-                              raise ValueError('Unsafe ZIP entry path')
-                          # This bucket belongs to this stack and hosts only generated assets.
-                          clear_bucket(destination)
-                          for name in names:
-                              mime, _ = mimetypes.guess_type(name)
-                              s3.put_object(
-                                  Bucket=destination,
-                                  Key=name,
-                                  Body=z.read(name),
-                                  ContentType=mime or 'application/octet-stream',
-                                  CacheControl='no-cache' if name == 'index.html' else 'public, max-age=3600'
-                              )
+                      source_object = s3.get_object(Bucket=source_bucket, Key=source_key)
+                      if source_object.get('ContentLength', 0) > 50 * 1024 * 1024:
+                          raise ValueError('Frontend ZIP exceeds the 50 MiB compressed deployment limit')
+                      archive = source_object['Body'].read()
+                      files = read_release(archive)
+                      index = files.pop('index.html')
+                      prefix = 'releases/' + version + '/'
+                      if ('/' + prefix).encode('utf-8') not in index:
+                          raise ValueError('index.html does not reference this ArtifactVersion asset prefix')
+                      # Upload immutable versioned assets first. Keep all prior release
+                      # assets so cached HTML and CloudFormation rollback remain usable.
+                      for name, body in files.items():
+                          mime, _ = mimetypes.guess_type(name)
+                          s3.put_object(
+                              Bucket=destination,
+                              Key=prefix + name,
+                              Body=body,
+                              ContentType=mime or 'application/octet-stream',
+                              CacheControl='public, max-age=31536000, immutable'
+                          )
+                      # S3 replaces one object atomically; old HTML remains live if any
+                      # validation or asset upload above fails.
+                      s3.put_object(
+                          Bucket=destination,
+                          Key='index.html',
+                          Body=index,
+                          ContentType='text/html; charset=utf-8',
+                          CacheControl='no-cache, max-age=0, must-revalidate'
+                      )
+                      index_published = True
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
               except Exception as e:
                   print('Frontend deployment failed:', repr(e))
+                  if prefix and not index_published:
+                      try:
+                          clear_prefix(destination, prefix)
+                      except Exception as cleanup_error:
+                          print('Failed to remove incomplete release assets:', repr(cleanup_error))
                   cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, physical_id)
 
   FrontendContent:
@@ -271,10 +333,13 @@ Resources:
       - FrontendBucketPolicy
     Properties:
       ServiceToken: !GetAtt FrontendDeployer.Arn
+      ServiceTimeout: 300
       DestinationBucket: !Ref FrontendBucket
       ArtifactBucket: !Ref ArtifactBucket
       FrontendZipKey: !Ref FrontendZipKey
       ArtifactVersion: !Ref ArtifactVersion
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
 
 Outputs:
   WebsiteURL:
