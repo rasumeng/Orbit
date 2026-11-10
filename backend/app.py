@@ -3,6 +3,9 @@ import json
 import hashlib
 import os
 import secrets
+import time
+import base64
+from decimal import Decimal
 from datetime import datetime, timezone
 from uuid import uuid4
 import boto3
@@ -15,7 +18,18 @@ STATUSES = {'pending', 'completed'}
 
 
 def response(status, data):
-    return {'statusCode': status, 'headers': {'content-type': 'application/json'}, 'body': json.dumps(data)}
+    def serialize_decimal(value):
+        if isinstance(value, Decimal):
+            if value == value.to_integral_value():
+                return int(value)
+            return float(value)
+        raise TypeError(f'Object of type {type(value).__name__} is not JSON serializable')
+
+    return {
+        'statusCode': status,
+        'headers': {'content-type': 'application/json'},
+        'body': json.dumps(data, default=serialize_decimal),
+    }
 
 
 def parse_body(event):
@@ -80,6 +94,117 @@ def workspace_id_from_code(code):
     return 'workspace-' + hashlib.sha256(code.strip().upper().encode('utf-8')).hexdigest()
 
 
+def scan_all(table, **kwargs):
+    """Read every matching scan page; Limit bounds evaluated rows per request."""
+    items = []
+    scan_kwargs = dict(kwargs)
+    seen_keys = set()
+    while True:
+        page = table.scan(**scan_kwargs)
+        items.extend(page.get('Items', []))
+        last_key = page.get('LastEvaluatedKey')
+        if not last_key:
+            return items
+        marker = json.dumps(last_key, sort_keys=True, separators=(',', ':'))
+        if marker in seen_keys:
+            raise RuntimeError('DynamoDB scan repeated its continuation key')
+        seen_keys.add(marker)
+        scan_kwargs['ExclusiveStartKey'] = last_key
+
+
+def encode_cursor(key):
+    if not key:
+        return None
+    return base64.urlsafe_b64encode(json.dumps(key, separators=(',', ':')).encode()).decode().rstrip('=')
+
+
+def decode_cursor(cursor):
+    if cursor is None or cursor == '':
+        return None
+    if not isinstance(cursor, str) or len(cursor) > 2048:
+        return None
+    try:
+        encoded = cursor + '=' * (-len(cursor) % 4)
+        raw = base64.b64decode(encoded, altchars=b'-_', validate=True)
+        value = json.loads(raw.decode())
+        if not isinstance(value, dict) or set(value) != {'id'} or not isinstance(value.get('id'), str) or not value['id']:
+            return None
+        return value
+    except (ValueError, TypeError, UnicodeError):
+        return None
+
+
+def project_for_invite(table, code):
+    # New projects get a deterministic key-addressable lookup record. Legacy projects
+    # are paginated as a fallback until invite records have been populated on write.
+    invite_id = 'invite-' + code
+    invite = table.get_item(Key={'id': invite_id}).get('Item')
+    if invite and invite.get('recordType') == 'project_invite':
+        project = table.get_item(Key={'id': invite.get('projectId', '')}).get('Item')
+        if project and project.get('recordType') == 'project' and project.get('inviteCode') == code:
+            return project
+    projects = scan_all(table, FilterExpression=Attr('recordType').eq('project') & Attr('inviteCode').eq(code))
+    return projects[0] if projects else None
+
+
+def join_project(table, project_id, member, workspace_key, retries=6):
+    for attempt in range(retries):
+        project = table.get_item(Key={'id': project_id}).get('Item')
+        if not project:
+            return None, 'missing'
+        members = list(project.get('members', []))
+        member_ids = list(project.get('memberIds', []))
+        version = project.get('membershipVersion', 0)
+        if member not in members:
+            members.append(member)
+        if workspace_key not in member_ids:
+            member_ids.append(workspace_key)
+        if members == project.get('members', []) and member_ids == project.get('memberIds', []):
+            return project, None
+        try:
+            table.update_item(
+                Key={'id': project_id},
+                UpdateExpression='SET members = :members, memberIds = :memberIds, membershipVersion = :nextVersion',
+                ConditionExpression='membershipVersion = :oldVersion OR attribute_not_exists(membershipVersion)',
+                ExpressionAttributeValues={
+                    ':members': members, ':memberIds': member_ids,
+                    ':oldVersion': version, ':nextVersion': version + 1,
+                },
+            )
+            return {**project, 'members': members, 'memberIds': member_ids, 'membershipVersion': version + 1}, None
+        except ClientError as exc:
+            if exc.response.get('Error', {}).get('Code') != 'ConditionalCheckFailedException':
+                raise
+            if attempt + 1 < retries:
+                time.sleep(0.005 * (2 ** attempt))
+    return None, 'conflict'
+
+
+def create_project(table, project, retries=8):
+    """Reserve a unique invite key before writing the project; retry rare collisions."""
+    for _ in range(retries):
+        code = secrets.token_hex(4).upper()
+        # Detect legacy projects which predate the lookup records.
+        if project_for_invite(table, code):
+            continue
+        invite_id = 'invite-' + code
+        invite_record = {'id': invite_id, 'recordType': 'project_invite', 'projectId': project['id']}
+        try:
+            table.put_item(Item=invite_record, ConditionExpression='attribute_not_exists(id)')
+        except ClientError as exc:
+            if exc.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+                continue
+            raise
+        project['inviteCode'] = code
+        try:
+            table.put_item(Item=project, ConditionExpression='attribute_not_exists(id)')
+            return
+        except Exception:
+            table.delete_item(Key={'id': invite_id}, ConditionExpression='projectId = :projectId', ExpressionAttributeValues={':projectId': project['id']})
+            raise
+    raise RuntimeError('Unable to reserve a unique project invite code')
+
+
 def handler(event, context):
     method = (event.get('requestContext', {}).get('http', {}).get('method') or event.get('httpMethod'))
     path = event.get('rawPath') or event.get('path') or ''
@@ -104,14 +229,6 @@ def handler(event, context):
             access_code = secrets.token_hex(12).upper()
             workspace = {'id': workspace_id_from_code(access_code), 'recordType': 'workspace', 'name': name.strip(), 'createdAt': datetime.now(timezone.utc).isoformat()}
             table.put_item(Item=workspace, ConditionExpression='attribute_not_exists(id)')
-            existing_records = table.scan(Limit=1000).get('Items', [])
-            existing_workspaces = [item for item in existing_records if item.get('recordType') == 'workspace']
-            if len(existing_workspaces) == 1:
-                for legacy in existing_records:
-                    if legacy.get('recordType') == 'project' and 'memberIds' not in legacy:
-                        table.update_item(Key={'id': legacy['id']}, UpdateExpression='SET memberIds = :members', ExpressionAttributeValues={':members': [workspace['id']]})
-                    elif legacy.get('recordType') != 'project' and 'projectId' not in legacy and 'workspaceId' not in legacy:
-                        table.update_item(Key={'id': legacy['id']}, UpdateExpression='SET workspaceId = :workspace', ExpressionAttributeValues={':workspace': workspace['id']})
             return response(201, {'workspace': {'id': workspace['id'], 'name': workspace['name']}, 'accessCode': access_code})
         if method == 'POST' and path == '/spaces/open':
             code = obj.get('accessCode', '').strip().upper() if obj and isinstance(obj.get('accessCode'), str) else ''
@@ -130,17 +247,21 @@ def handler(event, context):
         member_projects = []
         project_ids = set()
         if method in ('GET', 'POST') and (path == '/projects' or path == '/items'):
-            project_result = table.scan(FilterExpression=Attr('recordType').eq('project'), Limit=1000)
-            member_projects = [project for project in project_result.get('Items', []) if workspace_key in project.get('memberIds', [])]
+            project_result = scan_all(table, FilterExpression=Attr('recordType').eq('project'))
+            member_projects = [project for project in project_result if workspace_key in project.get('memberIds', [])]
             project_ids = {project['id'] for project in member_projects}
         if method == 'GET' and path == '/spaces/me':
             return response(200, {'workspace': {'id': workspace_key, 'name': workspace['name']}})
         if method == 'GET' and path == '/items':
-            # Scan is appropriate only for the small, shared midpoint demonstration dataset.
-            result = table.scan(Limit=100)
-            items = [item for item in result.get('Items', []) if item.get('recordType') != 'project' and (item.get('workspaceId') == workspace_key or item.get('projectId') in project_ids)]
+            cursor = (event.get('queryStringParameters') or {}).get('cursor')
+            exclusive_start_key = decode_cursor(cursor)
+            if cursor and not exclusive_start_key:
+                return response(400, {'error': 'Invalid pagination cursor'})
+            result = table.scan(Limit=100, **({'ExclusiveStartKey': exclusive_start_key} if exclusive_start_key else {}))
+            items = [item for item in result.get('Items', []) if item.get('recordType') not in {'project', 'workspace', 'project_invite'} and (item.get('workspaceId') == workspace_key or item.get('projectId') in project_ids)]
             items.sort(key=lambda x: x.get('dueAt', ''))
-            return response(200, {'items': items, 'truncated': bool(result.get('LastEvaluatedKey'))})
+            next_cursor = encode_cursor(result.get('LastEvaluatedKey'))
+            return response(200, {'items': items, 'nextCursor': next_cursor, 'truncated': bool(next_cursor)})
         if method == 'GET' and path == '/projects':
             projects = member_projects
             projects.sort(key=lambda project: project.get('createdAt', ''))
@@ -155,11 +276,11 @@ def handler(event, context):
                 return response(400, {'error': 'Your name must be 1–40 characters'})
             project = {
                 'id': str(uuid4()), 'recordType': 'project', 'name': name.strip(),
-                'inviteCode': secrets.token_hex(4).upper(), 'members': [member.strip()],
+                'inviteCode': '', 'members': [member.strip()], 'membershipVersion': 0,
                 'memberIds': [workspace_key],
                 'createdAt': datetime.now(timezone.utc).isoformat(),
             }
-            table.put_item(Item=project, ConditionExpression='attribute_not_exists(id)')
+            create_project(table, project)
             return response(201, {'project': project})
         if method == 'POST' and path == '/projects/join':
             obj = parse_body(event)
@@ -169,17 +290,13 @@ def handler(event, context):
                 return response(400, {'error': 'Enter a valid 8-character invite code'})
             if not isinstance(member, str) or not 1 <= len(member.strip()) <= 40:
                 return response(400, {'error': 'Your name must be 1–40 characters'})
-            result = table.scan(FilterExpression=Attr('recordType').eq('project') & Attr('inviteCode').eq(code), Limit=100)
-            projects = result.get('Items', [])
-            if not projects:
+            project = project_for_invite(table, code)
+            if not project or project.get('recordType') != 'project':
                 return response(404, {'error': 'No project found for that invite code'})
-            project = projects[0]
             member = member.strip()
-            if member not in project.get('members', []):
-                project.setdefault('members', []).append(member)
-            if workspace_key not in project.get('memberIds', []):
-                project.setdefault('memberIds', []).append(workspace_key)
-            table.update_item(Key={'id': project['id']}, UpdateExpression='SET members = :members, memberIds = :memberIds', ExpressionAttributeValues={':members': project['members'], ':memberIds': project['memberIds']})
+            project, join_error = join_project(table, project['id'], member, workspace_key)
+            if join_error:
+                return response(404 if join_error == 'missing' else 409, {'error': 'Project no longer available' if join_error == 'missing' else 'Project membership changed; please retry'})
             return response(200, {'project': project})
         if method == 'POST' and path == '/items':
             obj = parse_body(event)
