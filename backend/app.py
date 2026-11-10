@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 import base64
+from decimal import Decimal
 from datetime import datetime, timezone
 from uuid import uuid4
 import boto3
@@ -17,7 +18,18 @@ STATUSES = {'pending', 'completed'}
 
 
 def response(status, data):
-    return {'statusCode': status, 'headers': {'content-type': 'application/json'}, 'body': json.dumps(data)}
+    def serialize_decimal(value):
+        if isinstance(value, Decimal):
+            if value == value.to_integral_value():
+                return int(value)
+            return float(value)
+        raise TypeError(f'Object of type {type(value).__name__} is not JSON serializable')
+
+    return {
+        'statusCode': status,
+        'headers': {'content-type': 'application/json'},
+        'body': json.dumps(data, default=serialize_decimal),
+    }
 
 
 def parse_body(event):

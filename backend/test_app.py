@@ -2,6 +2,7 @@
 import json
 import threading
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 from boto3.dynamodb.conditions import Attr
@@ -106,6 +107,28 @@ class ReliabilityTests(unittest.TestCase):
             {'id': self.workspace_a, 'recordType': 'workspace', 'name': 'A'},
             {'id': self.workspace_b, 'recordType': 'workspace', 'name': 'B'},
         ]
+
+    def test_response_serializes_nested_decimal_values(self):
+        result = app.response(200, {
+            'whole': Decimal('7.000'),
+            'nested': [{'fractional': Decimal('2.75'), 'whole': Decimal('-3')}],
+        })
+        self.assertEqual(json.loads(result['body']), {
+            'whole': 7,
+            'nested': [{'fractional': 2.75, 'whole': -3}],
+        })
+
+    def test_projects_listing_serializes_decimal_membership_version(self):
+        project = {
+            'id': 'p', 'recordType': 'project', 'workspaceId': self.workspace_a,
+            'name': 'Team', 'members': ['Alice'], 'memberIds': [self.workspace_a],
+            'membershipVersion': Decimal('4'),
+        }
+        table = FakeTable(self.base + [project])
+        status, result = invoke(table, 'GET', '/projects', self.code_a)
+        self.assertEqual(status, 200)
+        self.assertEqual(result['projects'][0]['membershipVersion'], 4)
+        self.assertIsInstance(result['projects'][0]['membershipVersion'], int)
 
     def test_items_paginate_beyond_100_and_isolate_workspaces(self):
         rows = self.base + [{'id': f'a-{i:03}', 'workspaceId': self.workspace_a, 'title': 'A'} for i in range(120)]
